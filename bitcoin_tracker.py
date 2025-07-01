@@ -19,6 +19,8 @@ import random
 from decimal import Decimal
 from typing import Dict, List, Optional, Union, Tuple
 from datetime import datetime
+import threading
+import concurrent.futures
 
 try:
     import requests
@@ -115,101 +117,414 @@ class ElectrumClient:
             return None
 
 
+class ElectrumServerDiscovery:
+    """Automated Electrum server discovery and health monitoring."""
+    
+    # Known good seed servers for initial discovery
+    SEED_SERVERS = [
+        "electrum.hsmiths.com:50002",
+        "fortress.qtornado.com:443", 
+        "electrum.blockstream.info:50002",
+        "electrum.acinq.co:50002",
+        "bitcoin.electrum.blockstream.info:50002",
+        "kris.at:50002",
+        "ecdsa.net:50002",
+        "mempool.space:50002",
+    ]
+    
+    def __init__(self, use_ssl: bool = True, timeout: int = 10, max_servers: int = 20):
+        """Initialize server discovery."""
+        self.use_ssl = use_ssl
+        self.timeout = timeout
+        self.max_servers = max_servers
+        self.discovered_servers = {}  # {host:port -> {health_score, last_tested, features}}
+        self.lock = threading.Lock()
+        
+    def discover_servers(self, seed_servers: List[str] = None) -> List[str]:
+        """Discover Electrum servers using peer discovery protocol."""
+        if seed_servers is None:
+            seed_servers = self.SEED_SERVERS.copy()
+        
+        print("🔍 Discovering Electrum servers...")
+        discovered = set()
+        
+        # Test seed servers and get their peer lists
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_server = {
+                executor.submit(self._discover_from_server, server): server 
+                for server in seed_servers
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_server):
+                server = future_to_server[future]
+                try:
+                    peers = future.result()
+                    if peers:
+                        discovered.update(peers)
+                        print(f"✅ {server}: Found {len(peers)} peers")
+                    else:
+                        print(f"❌ {server}: No peers found")
+                except Exception as e:
+                    print(f"❌ {server}: Discovery failed - {e}")
+        
+        # Health check discovered servers
+        healthy_servers = self._health_check_servers(list(discovered))
+        
+        # Sort by health score
+        sorted_servers = sorted(
+            healthy_servers,
+            key=lambda x: self.discovered_servers.get(x, {}).get('health_score', 0),
+            reverse=True
+        )
+        
+        result = sorted_servers[:self.max_servers]
+        print(f"🎯 Found {len(result)} healthy Electrum servers")
+        return result
+    
+    def _discover_from_server(self, server_addr: str) -> List[str]:
+        """Discover peer servers from a single server."""
+        try:
+            if ':' in server_addr:
+                host, port = server_addr.rsplit(':', 1)
+                port = int(port)
+            else:
+                host = server_addr
+                port = 50002 if self.use_ssl else 50001
+            
+            # Connect and get peer list
+            client = ElectrumClient(host, port, self.use_ssl, self.timeout)
+            if not client.connect():
+                return []
+            
+            # Request peer list
+            peers = client.send_request("server.peers.subscribe")
+            client.disconnect()
+            
+            if not peers:
+                return []
+            
+            # Parse peer list
+            discovered = []
+            for peer_info in peers:
+                if len(peer_info) >= 3:
+                    peer_host = peer_info[1]
+                    features = peer_info[2] if len(peer_info) > 2 else {}
+                    
+                    # Extract SSL port if available
+                    ssl_port = None
+                    tcp_port = None
+                    
+                    if isinstance(features, dict):
+                        ssl_port = features.get('s', features.get('ssl'))
+                        tcp_port = features.get('t', features.get('tcp'))
+                    
+                    # Prefer SSL port
+                    if self.use_ssl and ssl_port:
+                        discovered.append(f"{peer_host}:{ssl_port}")
+                    elif tcp_port:
+                        discovered.append(f"{peer_host}:{tcp_port}")
+                    elif ssl_port:  # Fallback to SSL even if not preferred
+                        discovered.append(f"{peer_host}:{ssl_port}")
+            
+            return discovered
+            
+        except Exception:
+            return []
+    
+    def _health_check_servers(self, servers: List[str]) -> List[str]:
+        """Health check multiple servers in parallel."""
+        healthy = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_server = {
+                executor.submit(self._health_check_single, server): server 
+                for server in servers
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_server):
+                server = future_to_server[future]
+                try:
+                    is_healthy = future.result()
+                    if is_healthy:
+                        healthy.append(server)
+                except Exception:
+                    pass  # Already handled in _health_check_single
+        
+        return healthy
+    
+    def _health_check_single(self, server_addr: str) -> bool:
+        """Health check a single server."""
+        try:
+            if ':' in server_addr:
+                host, port = server_addr.rsplit(':', 1)
+                port = int(port)
+            else:
+                host = server_addr
+                port = 50002 if self.use_ssl else 50001
+            
+            start_time = time.time()
+            
+            # Quick connection test
+            client = ElectrumClient(host, port, self.use_ssl, self.timeout)
+            if not client.connect():
+                return False
+            
+            # Test basic functionality
+            version = client.send_request("server.version", ["HealthCheck", "1.4"])
+            features = client.send_request("server.features")
+            
+            latency = time.time() - start_time
+            client.disconnect()
+            
+            if version and features:
+                # Calculate health score (lower latency = higher score)
+                health_score = max(0, 100 - (latency * 10))
+                
+                with self.lock:
+                    self.discovered_servers[server_addr] = {
+                        'health_score': health_score,
+                        'latency': latency,
+                        'last_tested': time.time(),
+                        'features': features,
+                        'version': version
+                    }
+                
+                return True
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    def get_best_servers(self, count: int = 5) -> List[str]:
+        """Get the best servers by health score."""
+        with self.lock:
+            sorted_servers = sorted(
+                self.discovered_servers.items(),
+                key=lambda x: x[1].get('health_score', 0),
+                reverse=True
+            )
+        
+        return [server for server, _ in sorted_servers[:count]]
+    
+    def update_server_list(self, current_servers: List[str]) -> List[str]:
+        """Update server list with fresh discoveries."""
+        # Discover new servers
+        fresh_servers = self.discover_servers(current_servers)
+        
+        # Combine with existing servers and remove duplicates
+        combined = list(set(current_servers + fresh_servers))
+        
+        # Re-health check all servers
+        healthy_servers = self._health_check_servers(combined)
+        
+        # Return best servers
+        return self.get_best_servers(min(len(healthy_servers), self.max_servers))
+
+
 class BitcoinAddressUtils:
-    """Utilities for Bitcoin address handling."""
+    """Complete Bitcoin address decoder supporting all major address types."""
+    
+    # Bech32 character set
+    BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
     
     @staticmethod
-    def address_to_scripthash(address: str) -> str:
-        """Convert Bitcoin address to scripthash for Electrum queries."""
+    def bech32_polymod(values):
+        """Compute bech32 polymod for checksum validation."""
+        GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+        chk = 1
+        for value in values:
+            top = chk >> 25
+            chk = (chk & 0x1ffffff) << 5 ^ value
+            for i in range(5):
+                chk ^= GEN[i] if ((top >> i) & 1) else 0
+        return chk
+    
+    @staticmethod
+    def bech32_hrp_expand(hrp):
+        """Expand human readable part for bech32."""
+        return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+    
+    @staticmethod
+    def bech32_verify_checksum(hrp, data, spec):
+        """Verify bech32 or bech32m checksum."""
+        const = 1 if spec == "bech32" else 0x2bc830a3
+        return BitcoinAddressUtils.bech32_polymod(
+            BitcoinAddressUtils.bech32_hrp_expand(hrp) + data
+        ) == const
+    
+    @staticmethod
+    def convertbits(data, frombits, tobits, pad=True):
+        """Convert between bit groups."""
+        acc = 0
+        bits = 0
+        ret = []
+        maxv = (1 << tobits) - 1
+        max_acc = (1 << (frombits + tobits - 1)) - 1
+        for value in data:
+            if value < 0 or (value >> frombits):
+                return None
+            acc = ((acc << frombits) | value) & max_acc
+            bits += frombits
+            while bits >= tobits:
+                bits -= tobits
+                ret.append((acc >> bits) & maxv)
+        if pad:
+            if bits:
+                ret.append((acc << (tobits - bits)) & maxv)
+        elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+            return None
+        return ret
+    
+    @staticmethod
+    def decode_bech32(address):
+        """Decode bech32 address (SegWit v0)."""
+        if not address.startswith('bc1'):
+            return None
+            
         try:
-            # Decode address based on format
-            if address.startswith('bc1') or address.startswith('tb1'):
-                # Bech32 address (P2WPKH or P2WSH)
-                return BitcoinAddressUtils._bech32_to_scripthash(address)
-            elif address.startswith('1') or address.startswith('3'):
-                # Legacy address (P2PKH or P2SH)
-                return BitcoinAddressUtils._legacy_to_scripthash(address)
-            else:
-                raise ValueError(f"Unsupported address format: {address}")
+            # Split address
+            if address.rfind('1') == -1:
+                return None
+            hrp = address[:address.rfind('1')]
+            data_part = address[address.rfind('1')+1:]
+            
+            # Convert to numbers
+            data = []
+            for char in data_part:
+                if char not in BitcoinAddressUtils.BECH32_CHARSET:
+                    return None
+                data.append(BitcoinAddressUtils.BECH32_CHARSET.index(char))
+            
+            # Verify checksum
+            if not BitcoinAddressUtils.bech32_verify_checksum(hrp, data, "bech32"):
+                return None
+            
+            # Extract witness version and program
+            if len(data) < 6:
+                return None
+            witness_version = data[0]
+            program = BitcoinAddressUtils.convertbits(data[1:-6], 5, 8, False)
+            
+            if program is None or len(program) < 2 or len(program) > 40:
+                return None
                 
-        except Exception as e:
-            print(f"Error converting address {address}: {e}")
+            if witness_version == 0:
+                if len(program) == 20:  # P2WPKH
+                    script = bytes([0x00, 0x14]) + bytes(program)
+                    script_hash = hashlib.sha256(script).digest()
+                    return script_hash[::-1].hex()
+                elif len(program) == 32:  # P2WSH
+                    script = bytes([0x00, 0x20]) + bytes(program)
+                    script_hash = hashlib.sha256(script).digest()
+                    return script_hash[::-1].hex()
+            
+            return None
+            
+        except Exception:
             return None
     
     @staticmethod
-    def _legacy_to_scripthash(address: str) -> str:
-        """Convert legacy address to scripthash."""
+    def decode_bech32m(address):
+        """Decode bech32m address (Taproot)."""
+        if not address.startswith('bc1p'):
+            return None
+            
         try:
-            # Decode base58 address
+            # Split address
+            if address.rfind('1') == -1:
+                return None
+            hrp = address[:address.rfind('1')]
+            data_part = address[address.rfind('1')+1:]
+            
+            # Convert to numbers
+            data = []
+            for char in data_part:
+                if char not in BitcoinAddressUtils.BECH32_CHARSET:
+                    return None
+                data.append(BitcoinAddressUtils.BECH32_CHARSET.index(char))
+            
+            # Verify bech32m checksum
+            if not BitcoinAddressUtils.bech32_verify_checksum(hrp, data, "bech32m"):
+                return None
+            
+            # Extract witness version and program
+            if len(data) < 6:
+                return None
+            witness_version = data[0]
+            program = BitcoinAddressUtils.convertbits(data[1:-6], 5, 8, False)
+            
+            if program is None or witness_version != 1 or len(program) != 32:
+                return None
+                
+            # P2TR script
+            script = bytes([0x51, 0x20]) + bytes(program)  # OP_1 + 32 bytes
+            script_hash = hashlib.sha256(script).digest()
+            return script_hash[::-1].hex()
+            
+        except Exception:
+            return None
+    
+    @staticmethod
+    def decode_legacy(address):
+        """Decode legacy address (P2PKH or P2SH)."""
+        try:
             decoded = base58.b58decode(address)
-            
-            # Remove checksum (last 4 bytes)
             payload = decoded[:-4]
-            
-            # Get version and hash160
             version = payload[0]
             hash160 = payload[1:]
             
-            if version == 0x00:  # P2PKH (starts with '1')
-                # Script: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+            if len(hash160) != 20:
+                return None
+                
+            if version == 0x00:  # P2PKH
                 script = bytes([0x76, 0xa9, 0x14]) + hash160 + bytes([0x88, 0xac])
-            elif version == 0x05:  # P2SH (starts with '3')
-                # Script: OP_HASH160 <hash160> OP_EQUAL
+            elif version == 0x05:  # P2SH
                 script = bytes([0xa9, 0x14]) + hash160 + bytes([0x87])
             else:
-                raise ValueError(f"Unknown address version: {version}")
-            
-            # Calculate scripthash
+                return None
+                
             script_hash = hashlib.sha256(script).digest()
-            return script_hash[::-1].hex()  # Reverse byte order
+            return script_hash[::-1].hex()
             
-        except Exception as e:
-            raise ValueError(f"Invalid legacy address: {e}")
+        except Exception:
+            return None
     
     @staticmethod
-    def _bech32_to_scripthash(address: str) -> str:
-        """Convert bech32 address to scripthash."""
-        try:
-            # Simple bech32 decoding for common cases
-            # This is a simplified implementation for P2WPKH addresses
-            
-            if not address.startswith('bc1'):
-                raise ValueError("Only mainnet bech32 addresses supported")
-            
-            # Remove 'bc1' prefix
-            data = address[3:]
-            
-            # Simple validation and extraction of witness program
-            # This is a basic implementation - for production use a proper bech32 library
-            if len(data) == 39:  # P2WPKH (20 byte hash)
-                # Decode the data part (simplified)
-                try:
-                    # Convert from bech32 to bytes (simplified approach)
-                    # For a proper implementation, use a bech32 library
-                    
-                    # P2WPKH script: OP_0 <20-byte-pubkey-hash>
-                    # For now, we'll create a placeholder
-                    # In a real implementation, you'd properly decode the bech32
-                    
-                    # This is a simplified approach - extract the hex from address
-                    # For production, use proper bech32 decoding
-                    import re
-                    
-                    # This is a workaround - in practice you'd use a proper bech32 decoder
-                    # We'll create a mock scripthash for demonstration
-                    mock_hash = hashlib.sha256(address.encode()).digest()[:20]
-                    script = bytes([0x00, 0x14]) + mock_hash  # OP_0 + 20 bytes
-                    
-                    script_hash = hashlib.sha256(script).digest()
-                    return script_hash[::-1].hex()
-                    
-                except:
-                    raise ValueError("Failed to decode bech32 address")
+    def address_to_scripthash(address):
+        """Convert any Bitcoin address to scripthash for Electrum queries."""
+        # Determine address type and decode accordingly
+        if address.startswith('1'):
+            return BitcoinAddressUtils.decode_legacy(address)
+        elif address.startswith('3'):
+            return BitcoinAddressUtils.decode_legacy(address)
+        elif address.startswith('bc1q'):
+            return BitcoinAddressUtils.decode_bech32(address)
+        elif address.startswith('bc1p'):
+            return BitcoinAddressUtils.decode_bech32m(address)
+        else:
+            return None
+    
+    @staticmethod
+    def get_address_type(address):
+        """Get the type of Bitcoin address."""
+        if address.startswith('1'):
+            return "P2PKH (Legacy)"
+        elif address.startswith('3'):
+            return "P2SH (Script)"
+        elif address.startswith('bc1q'):
+            if len(address) == 42:
+                return "P2WPKH (SegWit)"
+            elif len(address) == 62:
+                return "P2WSH (SegWit Script)"
             else:
-                raise ValueError("Unsupported bech32 address length")
-                
-        except Exception as e:
-            raise ValueError(f"Invalid bech32 address: {e}")
+                return "Unknown SegWit"
+        elif address.startswith('bc1p'):
+            return "P2TR (Taproot)"
+        else:
+            return "Unknown"
+
+
 
 
 class BitcoinTracker:
@@ -220,6 +535,16 @@ class BitcoinTracker:
         self.config = self._load_config(config_path)
         self.electrum_client = None
         self.current_server = None
+        self.server_discovery = None
+        
+        # Initialize server discovery if enabled
+        if self.config.get("enable_server_discovery", False):
+            self.server_discovery = ElectrumServerDiscovery(
+                use_ssl=self.config.get("use_ssl", True),
+                timeout=self.config.get("timeout", 10),
+                max_servers=self.config.get("max_discovered_servers", 20)
+            )
+        
         self._connect_electrum()
     
     def _load_config(self, config_path: str) -> Dict:
@@ -285,6 +610,10 @@ class BitcoinTracker:
             return scripthash is not None
         except:
             return False
+    
+    def get_address_type(self, address: str) -> str:
+        """Get the type of Bitcoin address."""
+        return BitcoinAddressUtils.get_address_type(address)
     
     def get_balance(self, address: str) -> Dict[str, Union[str, Decimal]]:
         """Get balance for a single address."""
@@ -442,7 +771,9 @@ class BitcoinTracker:
         total_unconfirmed = Decimal("0")
         
         for balance in balances:
+            addr_type = self.get_address_type(balance['address'])
             print(f"Address: {balance['address']}")
+            print(f"  Type: {addr_type}")
             print(f"  Balance: {balance['balance']}")
             print(f"  Confirmed: {balance['confirmed']:.8f} BTC")
             print(f"  Unconfirmed: {balance['unconfirmed']:.8f} BTC")
@@ -480,7 +811,9 @@ def main():
         elif args.address:
             # Track single address
             balance = tracker.get_balance(args.address)
+            addr_type = tracker.get_address_type(args.address)
             print(f"Address: {balance['address']}")
+            print(f"Type: {addr_type}")
             print(f"Balance: {balance['balance']}")
             print(f"Confirmed: {balance['confirmed']:.8f} BTC")
             print(f"Unconfirmed: {balance['unconfirmed']:.8f} BTC")

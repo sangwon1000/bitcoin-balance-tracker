@@ -6,7 +6,8 @@ A lightweight Python application that tracks Bitcoin wallet balances using publi
 
 - **No Bitcoin Node Required**: Uses public Electrum servers - no setup, no storage, no syncing
 - **Instant Setup**: Start tracking addresses in seconds
-- **Multiple Address Support**: Monitor multiple Bitcoin addresses simultaneously
+- **Complete Address Support**: ALL Bitcoin address types (Legacy, SegWit, Taproot)
+- **Multiple Address Monitoring**: Track unlimited Bitcoin addresses simultaneously
 - **Real-time Balance Updates**: Get current balances including unconfirmed transactions
 - **Multiple Server Support**: Automatically connects to available Electrum servers
 - **Privacy Focused**: Rotates between servers and supports SSL connections
@@ -99,9 +100,17 @@ python bitcoin_tracker.py --server-info
 
 ### Supported Address Types
 
-- **P2PKH**: Legacy addresses starting with '1' (e.g., 1A1zP1eP...)
-- **P2SH**: Script addresses starting with '3' (e.g., 3J98t1W...)
-- **P2WPKH**: Bech32 addresses starting with 'bc1' (limited support)
+✅ **ALL major Bitcoin address types are fully supported:**
+
+- **P2PKH (Legacy)**: Addresses starting with `1` - Original Bitcoin format (2009)
+- **P2SH (Script)**: Addresses starting with `3` - Multisig and smart contracts (2012)  
+- **P2WPKH (SegWit)**: Addresses starting with `bc1q` (42 chars) - **RECOMMENDED** for lower fees (2017)
+- **P2WSH (SegWit Script)**: Addresses starting with `bc1q` (62 chars) - Complex scripts with SegWit benefits
+- **P2TR (Taproot)**: Addresses starting with `bc1p` - **NEWEST** with enhanced privacy and Schnorr signatures (2021)
+
+**Your addresses are P2WPKH (SegWit)** - excellent choice for efficiency and compatibility! 
+
+📋 See `address_types.md` for detailed comparison and recommendations.
 
 ## Electrum Servers
 
