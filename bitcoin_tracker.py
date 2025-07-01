@@ -207,16 +207,20 @@ class ElectrumServerDiscovery:
             discovered = []
             for peer_info in peers:
                 if len(peer_info) >= 3:
-                    peer_host = peer_info[1]
-                    features = peer_info[2] if len(peer_info) > 2 else {}
+                    peer_host = peer_info[1]  # hostname
+                    features = peer_info[2] if len(peer_info) > 2 else []
                     
-                    # Extract SSL port if available
+                    # Extract SSL and TCP ports from features array
                     ssl_port = None
                     tcp_port = None
                     
-                    if isinstance(features, dict):
-                        ssl_port = features.get('s', features.get('ssl'))
-                        tcp_port = features.get('t', features.get('tcp'))
+                    if isinstance(features, list):
+                        for feature in features:
+                            if isinstance(feature, str):
+                                if feature.startswith('s'):
+                                    ssl_port = feature[1:]  # Remove 's' prefix
+                                elif feature.startswith('t'):
+                                    tcp_port = feature[1:]  # Remove 't' prefix
                     
                     # Prefer SSL port
                     if self.use_ssl and ssl_port:
@@ -566,42 +570,65 @@ class BitcoinTracker:
         use_ssl = self.config.get("use_ssl", True)
         timeout = self.config.get("timeout", 10)
         
-        if not servers:
-            print("Error: No Electrum servers configured.")
-            sys.exit(1)
+        # Try configured servers first
+        if servers:
+            # Shuffle servers for load balancing
+            random.shuffle(servers)
+            
+            for server_addr in servers:
+                if self._try_connect_server(server_addr, use_ssl, timeout):
+                    return
         
-        # Shuffle servers for load balancing
-        random.shuffle(servers)
+        # If no configured servers or all failed, try server discovery
+        if self.server_discovery:
+            print("📡 Configured servers failed, trying server discovery...")
+            discovered_servers = self.server_discovery.discover_servers(servers if servers else None)
+            
+            for server_addr in discovered_servers:
+                if self._try_connect_server(server_addr, use_ssl, timeout):
+                    return
         
-        for server_addr in servers:
-            try:
-                if ':' in server_addr:
-                    host, port = server_addr.rsplit(':', 1)
-                    port = int(port)
-                else:
-                    host = server_addr
-                    port = 50002 if use_ssl else 50001
-                
-                print(f"Connecting to Electrum server: {host}:{port}")
-                
-                client = ElectrumClient(host, port, use_ssl, timeout)
-                if client.connect():
-                    # Test connection with server version
-                    version = client.send_request("server.version", ["BitcoinTracker", "1.4"])
-                    if version:
-                        print(f"Connected to {host}:{port} - Server: {version}")
-                        self.electrum_client = client
-                        self.current_server = f"{host}:{port}"
-                        return
-                    
-                client.disconnect()
-                
-            except Exception as e:
-                print(f"Failed to connect to {server_addr}: {e}")
-                continue
+        # Final fallback to seed servers
+        if not servers or not self.server_discovery:
+            print("🔄 Trying fallback seed servers...")
+            seed_servers = ElectrumServerDiscovery.SEED_SERVERS
+            random.shuffle(seed_servers)
+            
+            for server_addr in seed_servers:
+                if self._try_connect_server(server_addr, use_ssl, timeout):
+                    return
         
-        print("Error: Could not connect to any Electrum server.")
+        print("❌ Error: Could not connect to any Electrum server.")
         sys.exit(1)
+    
+    def _try_connect_server(self, server_addr: str, use_ssl: bool, timeout: int) -> bool:
+        """Try to connect to a single server."""
+        try:
+            if ':' in server_addr:
+                host, port = server_addr.rsplit(':', 1)
+                port = int(port)
+            else:
+                host = server_addr
+                port = 50002 if use_ssl else 50001
+            
+            print(f"🔌 Connecting to Electrum server: {host}:{port}")
+            
+            client = ElectrumClient(host, port, use_ssl, timeout)
+            if client.connect():
+                # Test connection with server version
+                version = client.send_request("server.version", ["BitcoinTracker", "1.4"])
+                if version:
+                    print(f"✅ Connected to {host}:{port} - Server: {version}")
+                    self.electrum_client = client
+                    self.current_server = f"{host}:{port}"
+                    return True
+                
+            client.disconnect()
+            
+        except Exception as e:
+            print(f"❌ Failed to connect to {server_addr}: {e}")
+        
+        return False
     
     def validate_address(self, address: str) -> bool:
         """Validate a Bitcoin address format."""
@@ -732,6 +759,79 @@ class BitcoinTracker:
         except Exception as e:
             return {"error": str(e), "connected": False}
     
+    def discover_servers(self) -> List[str]:
+        """Manually trigger server discovery."""
+        if not self.server_discovery:
+            self.server_discovery = ElectrumServerDiscovery(
+                use_ssl=self.config.get("use_ssl", True),
+                timeout=self.config.get("timeout", 10),
+                max_servers=self.config.get("max_discovered_servers", 20)
+            )
+        
+        return self.server_discovery.discover_servers()
+    
+    def update_server_list(self) -> List[str]:
+        """Update and refresh the server list."""
+        if not self.server_discovery:
+            print("❌ Server discovery not enabled in config")
+            return []
+        
+        current_servers = self.config.get("electrum_servers", [])
+        return self.server_discovery.update_server_list(current_servers)
+    
+    def save_discovered_servers(self, servers: List[str], config_path: str = None):
+        """Save discovered servers to config file."""
+        if not servers:
+            print("❌ No servers to save")
+            return
+        
+        if config_path is None:
+            config_path = "config.json"
+        
+        # Update config
+        self.config["electrum_servers"] = servers
+        
+        # Save to file
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            print(f"✅ Saved {len(servers)} servers to {config_path}")
+        except Exception as e:
+            print(f"❌ Failed to save config: {e}")
+    
+    def show_discovery_status(self):
+        """Show current server discovery status and health scores."""
+        if not self.server_discovery:
+            print("❌ Server discovery not initialized")
+            return
+        
+        print("\n" + "="*60)
+        print("🔍 SERVER DISCOVERY STATUS")
+        print("="*60)
+        
+        with self.server_discovery.lock:
+            if not self.server_discovery.discovered_servers:
+                print("No servers discovered yet. Run discovery first.")
+                return
+            
+            sorted_servers = sorted(
+                self.server_discovery.discovered_servers.items(),
+                key=lambda x: x[1].get('health_score', 0),
+                reverse=True
+            )
+            
+            print(f"{'Server':<35} {'Health':<8} {'Latency':<10} {'Last Tested':<15}")
+            print("-" * 75)
+            
+            for server, data in sorted_servers:
+                health = f"{data.get('health_score', 0):.1f}"
+                latency = f"{data.get('latency', 0):.2f}s"
+                last_tested = datetime.fromtimestamp(
+                    data.get('last_tested', 0)
+                ).strftime('%H:%M:%S')
+                
+                print(f"{server:<35} {health:<8} {latency:<10} {last_tested:<15}")
+    
     def monitor_continuous(self):
         """Run continuous monitoring with periodic updates."""
         print("Starting continuous monitoring...")
@@ -796,12 +896,42 @@ def main():
     parser.add_argument("--history", action="store_true", help="Show transaction history")
     parser.add_argument("--server-info", action="store_true", help="Show server information")
     
+    # Server discovery options
+    parser.add_argument("--discover-servers", action="store_true", help="Discover and test Electrum servers")
+    parser.add_argument("--update-servers", action="store_true", help="Update server list with fresh discoveries")
+    parser.add_argument("--save-servers", action="store_true", help="Save discovered servers to config")
+    parser.add_argument("--show-discovery", action="store_true", help="Show server discovery status and health scores")
+    
     args = parser.parse_args()
     
     try:
         tracker = BitcoinTracker(args.config)
         
-        if args.server_info:
+        # Handle server discovery commands
+        if args.discover_servers:
+            print("🔍 Starting server discovery...")
+            servers = tracker.discover_servers()
+            print(f"\n📋 Discovered {len(servers)} servers:")
+            for i, server in enumerate(servers, 1):
+                print(f"  {i:2d}. {server}")
+            
+            if args.save_servers and servers:
+                tracker.save_discovered_servers(servers, args.config)
+                
+        elif args.update_servers:
+            print("🔄 Updating server list...")
+            servers = tracker.update_server_list()
+            print(f"\n📋 Updated server list ({len(servers)} servers):")
+            for i, server in enumerate(servers, 1):
+                print(f"  {i:2d}. {server}")
+            
+            if args.save_servers and servers:
+                tracker.save_discovered_servers(servers, args.config)
+                
+        elif args.show_discovery:
+            tracker.show_discovery_status()
+            
+        elif args.server_info:
             # Show server information
             info = tracker.get_server_info()
             print("Server Information:")
